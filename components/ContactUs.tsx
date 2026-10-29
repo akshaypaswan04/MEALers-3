@@ -66,13 +66,13 @@ const ContactUs: React.FC<ContactUsProps> = ({ user, onBack }) => {
                     <p className="text-slate-400 font-medium max-w-sm leading-relaxed mb-6">We're here to help with any questions, technical issues, or feedback you might have.</p>
                     
                     <div className="flex flex-col md:flex-row gap-3">
-                        <a href="tel:+918591095318" className="inline-flex items-center gap-3 bg-white/10 hover:bg-white/20 backdrop-blur-md border border-white/10 px-5 py-3 rounded-2xl transition-all group">
+                        <a href="tel:+917208471834" className="inline-flex items-center gap-3 bg-white/10 hover:bg-white/20 backdrop-blur-md border border-white/10 px-5 py-3 rounded-2xl transition-all group">
                             <div className="w-10 h-10 bg-emerald-500 rounded-xl flex items-center justify-center text-white shadow-lg group-hover:scale-110 transition-transform shrink-0">
                                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z" /></svg>
                             </div>
                             <div>
                                 <p className="text-[10px] font-black uppercase tracking-widest text-emerald-400">Call Us Now</p>
-                                <p className="text-lg font-bold text-white tracking-wide">+91 85910 95318</p>
+                                <p className="text-lg font-bold text-white tracking-wide">+91 72084 71834</p>
                             </div>
                         </a>
 

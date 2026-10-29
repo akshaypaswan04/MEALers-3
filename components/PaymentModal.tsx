@@ -46,7 +46,7 @@ const PaymentModal: React.FC<PaymentModalProps> = ({ amount, onSuccess, onCancel
   const isValidBank = selectedBank !== '';
 
   // Dynamic QR Code Generation
-  const upiId = "8591095318@fam";
+  const upiId = "7208471834@fam";
   const qrData = `upi://pay?pa=${upiId}&pn=MEALers&am=${amount.toFixed(2)}&cu=INR`;
   const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(qrData)}`;
 
