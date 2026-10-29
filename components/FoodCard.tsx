@@ -1,0 +1,766 @@
+
+import React, { useState, useRef } from 'react';
+import { FoodPosting, User, UserRole, FoodStatus } from '../types';
+import DirectionsModal from './DirectionsModal';
+import LiveTrackingModal from './LiveTrackingModal';
+import RatingModal from './RatingModal';
+import VerificationRequestModal from './VerificationRequestModal';
+import { generateSpeech, askWithMaps } from '../services/geminiService';
+
+interface FoodCardProps {
+  posting: FoodPosting;
+  user: User;
+  onUpdate: (id: string, updates: Partial<FoodPosting>) => void;
+  onDelete?: (id: string) => void;
+  currentLocation?: { lat: number; lng: number };
+  onRateVolunteer?: (postingId: string, rating: number, feedback: string) => void;
+  onChatClick?: (postingId: string) => void;
+  volunteerProfile?: User;
+  requesterProfile?: User;
+}
+
+const resizeImage = (file: File): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        const MAX_WIDTH = 800;
+        const scale = img.width > MAX_WIDTH ? MAX_WIDTH / img.width : 1;
+        canvas.width = img.width * scale;
+        canvas.height = img.height * scale;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            resolve(canvas.toDataURL('image/jpeg', 0.8));
+        } else {
+            resolve(e.target?.result as string);
+        }
+      };
+      img.onerror = reject;
+      img.src = e.target?.result as string;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+};
+
+const FoodCard: React.FC<FoodCardProps> = ({ posting, user, onUpdate, onDelete, currentLocation, onRateVolunteer, onChatClick, volunteerProfile, requesterProfile }) => {
+  const [showDirections, setShowDirections] = useState(false);
+  const [showTracking, setShowTracking] = useState(false);
+  const [showRating, setShowRating] = useState(false);
+  const [isVerifying, setIsVerifying] = useState(false);
+  const [isPickingUp, setIsPickingUp] = useState(false);
+  const [showPreview, setShowPreview] = useState(false);
+  const [isConfirmingStart, setIsConfirmingStart] = useState(false);
+  const [showVerificationModal, setShowVerificationModal] = useState(false);
+  const [showCancelConfirmation, setShowCancelConfirmation] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
+  
+  // Maps Grounding State
+  const [locationInsight, setLocationInsight] = useState<{text: string, sources: any[]} | null>(null);
+  const [isLoadingInsight, setIsLoadingInsight] = useState(false);
+  
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const pickupInputRef = useRef<HTMLInputElement>(null);
+  
+  const isClothes = posting.donationType === 'CLOTHES';
+  
+  const expiryTimestamp = new Date(posting.expiryDate).getTime();
+  const hoursLeft = (expiryTimestamp - Date.now()) / (1000 * 60 * 60);
+  const isUrgent = posting.status === FoodStatus.AVAILABLE && hoursLeft > 0 && hoursLeft < (isClothes ? 48 : 12); // Longer urgency for clothes
+
+  const hasRated = posting.ratings?.some(r => r.raterId === user?.id);
+  const isSafetyUnknownOrUnsafe = posting.safetyVerdict && !posting.safetyVerdict.isSafe;
+
+  const isInvolved = user && (
+    user.id === posting.donorId || 
+    user.id === posting.volunteerId || 
+    user.id === posting.orphanageId
+  );
+
+  const handleRequest = () => {
+    if (!user) return;
+    onUpdate(posting.id, {
+      status: FoodStatus.REQUESTED,
+      orphanageId: user.id,
+      orphanageName: user.orgName || user.name || 'Requester',
+      requesterAddress: user.address
+    });
+  };
+
+  const handleExpressInterest = () => {
+    if (!user) return;
+    const updated = [...(posting.interestedVolunteers || []), { userId: user.id, userName: user.name || 'Volunteer' }];
+    onUpdate(posting.id, { interestedVolunteers: updated });
+    alert("Interest recorded! You'll be notified if a requester selects you, or wait for the status to change to Requested.");
+  };
+
+  const confirmStartVolunteering = () => {
+      if (!user) return;
+      onUpdate(posting.id, {
+          volunteerId: user.id,
+          volunteerName: user.name || 'Volunteer'
+      });
+      setIsConfirmingStart(false);
+  };
+
+  const handleManualSafetyOverride = () => {
+    if (confirm("Are you sure you want to mark this item as safe? This will override the AI warning.")) {
+        onUpdate(posting.id, {
+            safetyVerdict: {
+                isSafe: true,
+                reasoning: "Manually verified by donor as safe."
+            }
+        });
+    }
+  };
+
+  const handleRetractVerification = () => {
+      if (confirm("Do you want to cancel the current verification request and re-upload the proof?")) {
+          onUpdate(posting.id, {
+              status: FoodStatus.REQUESTED,
+              pickupVerificationImageUrl: undefined
+          });
+      }
+  };
+  
+  const handleApprove = () => {
+      if (posting.status === FoodStatus.PICKUP_VERIFICATION_PENDING) {
+         onUpdate(posting.id, { status: FoodStatus.IN_TRANSIT });
+      } else if (posting.status === FoodStatus.DELIVERY_VERIFICATION_PENDING) {
+         onUpdate(posting.id, { status: FoodStatus.DELIVERED });
+      }
+      setShowVerificationModal(false);
+  };
+
+  const handleReject = () => {
+      if (posting.status === FoodStatus.PICKUP_VERIFICATION_PENDING) {
+          if (confirm("Are you sure you want to reject this pickup proof?")) {
+              onUpdate(posting.id, {
+                  status: FoodStatus.REQUESTED,
+                  pickupVerificationImageUrl: undefined,
+              });
+              setShowVerificationModal(false);
+          }
+      } else if (posting.status === FoodStatus.DELIVERY_VERIFICATION_PENDING) {
+          if (confirm("Are you sure you want to reject this delivery proof?")) {
+              onUpdate(posting.id, {
+                  status: FoodStatus.IN_TRANSIT,
+                  verificationImageUrl: undefined,
+              });
+              setShowVerificationModal(false);
+          }
+      }
+  };
+
+  const handleConfirmDelete = () => {
+      if (onDelete) {
+          onDelete(posting.id);
+      }
+      setShowCancelConfirmation(false);
+  };
+
+  const handleReport = () => {
+      if (!user) return;
+      const reason = window.prompt("Please provide a reason for reporting this posting:");
+      if (reason) {
+          console.log(`[ADMIN REPORT] User ${user.id} (${user.name}) reported Posting ${posting.id}. Reason: "${reason}"`);
+          alert("Thank you. The posting has been reported to the administration for review.");
+      }
+  };
+
+  const handleShare = async () => {
+    const shareData = {
+      title: `Donation: ${posting.foodName}`,
+      text: `Help rescue items! ${posting.quantity} of ${posting.foodName} available at ${posting.location.line1}.`,
+      url: window.location.href
+    };
+
+    if (navigator.share) {
+      try {
+        await navigator.share(shareData);
+      } catch (err) {
+        console.log('Share cancelled or failed');
+      }
+    } else {
+      try {
+        await navigator.clipboard.writeText(`${shareData.title}\n${shareData.text}\n${shareData.url}`);
+        alert('Details copied to clipboard!');
+      } catch (err) {
+        alert('Unable to copy details. Please share the URL manually.');
+      }
+    }
+  };
+
+  const handlePickupUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !user) return;
+
+    setIsPickingUp(true);
+    try {
+        const base64 = await resizeImage(file);
+        onUpdate(posting.id, { 
+            status: FoodStatus.PICKUP_VERIFICATION_PENDING, 
+            pickupVerificationImageUrl: base64,
+            volunteerId: user.id,
+            volunteerName: user.name || 'Volunteer',
+            volunteerLocation: currentLocation
+        });
+        alert("Pickup proof uploaded! Sent to Donor for final approval.");
+    } catch (error) {
+        console.error(error);
+        alert("Error processing pickup image.");
+    } finally {
+        setIsPickingUp(false);
+        if (pickupInputRef.current) pickupInputRef.current.value = '';
+    }
+  };
+
+  const handleVerificationUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !user) return;
+
+    setIsVerifying(true);
+    try {
+        const base64 = await resizeImage(file);
+        if (user.role === UserRole.REQUESTER) {
+            onUpdate(posting.id, { 
+                status: FoodStatus.DELIVERED, 
+                verificationImageUrl: base64 
+            });
+            alert("Delivery confirmed! Thank you.");
+        } else {
+            onUpdate(posting.id, { 
+                status: FoodStatus.DELIVERY_VERIFICATION_PENDING, 
+                verificationImageUrl: base64 
+            });
+            alert("Proof uploaded! Sent to Requester for confirmation.");
+        }
+    } catch (error) {
+        console.error(error);
+        alert("Error processing image.");
+    } finally {
+        setIsVerifying(false);
+        if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  const handleTTS = async () => {
+      if (isPlaying) return;
+      setIsPlaying(true);
+      const text = `${isClothes ? 'Clothes' : 'Food'} Donation: ${posting.foodName}. Quantity: ${posting.quantity}. Description: ${posting.description || 'No description'}. Available until ${hoursLeft > 0 ? Math.floor(hoursLeft) + ' hours from now' : 'now'}.`;
+      
+      const audioData = await generateSpeech(text);
+      if (audioData) {
+          const binaryString = atob(audioData);
+          const len = binaryString.length;
+          const bytes = new Uint8Array(len);
+          for (let i = 0; i < len; i++) {
+              bytes[i] = binaryString.charCodeAt(i);
+          }
+          try {
+             // Create WAV header
+             const wavHeader = new Uint8Array(44 + bytes.length);
+             const view = new DataView(wavHeader.buffer);
+             // Standard WAV header setup... (omitted for brevity, same as previous)
+             // ... RIFF ...
+             view.setUint32(0, 0x52494646, false);
+             view.setUint32(4, 36 + bytes.length, true);
+             view.setUint32(8, 0x57415645, false);
+             view.setUint32(12, 0x666d7420, false);
+             view.setUint32(16, 16, true);
+             view.setUint16(20, 1, true);
+             view.setUint16(22, 1, true);
+             view.setUint32(24, 24000, true);
+             view.setUint32(28, 24000 * 2, true);
+             view.setUint16(32, 2, true);
+             view.setUint16(34, 16, true);
+             view.setUint32(36, 0x64617461, false);
+             view.setUint32(40, bytes.length, true);
+             wavHeader.set(bytes, 44);
+
+             const blob = new Blob([wavHeader], { type: 'audio/wav' });
+             const url = URL.createObjectURL(blob);
+             const audio = new Audio(url);
+             audio.onended = () => setIsPlaying(false);
+             audio.play();
+          } catch(e) {
+             console.error("Audio playback error", e);
+             setIsPlaying(false);
+          }
+      } else {
+          setIsPlaying(false);
+      }
+  };
+
+  const handleLocationInsight = async () => {
+      if (locationInsight) {
+          setLocationInsight(null);
+          return;
+      }
+      setIsLoadingInsight(true);
+      const query = `Provide a brief, helpful summary of the location "${posting.location.line1}, ${posting.location.line2}". Is it residential, commercial, or public? Any notable landmarks nearby?`;
+      const result = await askWithMaps(query, posting.location.lat && posting.location.lng ? { lat: posting.location.lat, lng: posting.location.lng } : undefined);
+      setLocationInsight(result);
+      setIsLoadingInsight(false);
+  };
+
+  const getOriginString = () => {
+      if (currentLocation) return `${currentLocation.lat},${currentLocation.lng}`;
+      if (user?.address) return `${user.address.line1}, ${user.address.line2}, ${user.address.pincode}`;
+      return '';
+  };
+
+  const getDestinationString = () => {
+      if (posting.requesterAddress) {
+          const addr = posting.requesterAddress;
+          return `${addr.line1}, ${addr.line2}, ${addr.landmark || ''}, ${addr.pincode}`;
+      }
+      return '';
+  };
+
+  const getPickupString = () => {
+      const addr = posting.location;
+      return `${addr.line1}, ${addr.line2}, ${addr.landmark || ''}, ${addr.pincode}`;
+  };
+
+  const mapsQuery = encodeURIComponent(`${posting.location.line1}, ${posting.location.line2}, ${posting.location.landmark || ''}, ${posting.location.pincode}`);
+  const mapsUrl = `https://www.google.com/maps/search/?api=1&query=${mapsQuery}`;
+
+  const renderStatusPill = () => {
+      switch (posting.status) {
+          case FoodStatus.AVAILABLE:
+              return <span className={`px-3 py-1.5 rounded-full text-[10px] font-black uppercase tracking-wider border shadow-sm backdrop-blur-md ${isClothes ? 'bg-indigo-100/90 text-indigo-800 border-indigo-200/50' : 'bg-emerald-100/90 text-emerald-800 border-emerald-200/50'}`}>Available</span>;
+          case FoodStatus.REQUESTED:
+              return <span className="px-3 py-1.5 rounded-full bg-blue-100/90 backdrop-blur-md text-blue-800 text-[10px] font-black uppercase tracking-wider border border-blue-200/50 shadow-sm">Requested</span>;
+          case FoodStatus.PICKUP_VERIFICATION_PENDING:
+              return <span className="px-3 py-1.5 rounded-full bg-amber-100/90 backdrop-blur-md text-amber-800 text-[10px] font-black uppercase tracking-wider border border-amber-200/50 shadow-sm">Verifying Pickup</span>;
+          case FoodStatus.IN_TRANSIT:
+              return <span className="px-3 py-1.5 rounded-full bg-indigo-100/90 backdrop-blur-md text-indigo-800 text-[10px] font-black uppercase tracking-wider border border-indigo-200/50 shadow-sm">On The Way</span>;
+          case FoodStatus.DELIVERY_VERIFICATION_PENDING:
+              return <span className="px-3 py-1.5 rounded-full bg-purple-100/90 backdrop-blur-md text-purple-800 text-[10px] font-black uppercase tracking-wider border border-purple-200/50 shadow-sm">Verifying Delivery</span>;
+          case FoodStatus.DELIVERED:
+              return <span className="px-3 py-1.5 rounded-full bg-slate-100/90 backdrop-blur-md text-slate-500 text-[10px] font-black uppercase tracking-wider border border-slate-200/50 shadow-sm">Delivered</span>;
+          default:
+              return null;
+      }
+  };
+
+  return (
+    <div className={`group rounded-[2.5rem] bg-white transition-all duration-300 ease-[cubic-bezier(0.23,1,0.32,1)] relative overflow-hidden flex flex-col h-full transform will-change-transform hover:scale-[1.02] hover:-translate-y-1 ${isUrgent ? 'ring-2 ring-rose-100 shadow-[0_20px_50px_-12px_rgba(244,63,94,0.2)] hover:shadow-[0_25px_60px_-12px_rgba(244,63,94,0.35)]' : `border border-slate-100 shadow-[0_20px_40px_-12px_rgba(0,0,0,0.05)] hover:shadow-[0_35px_60px_-15px_rgba(0,0,0,0.12)] ${isClothes ? 'hover:border-indigo-100' : 'hover:border-emerald-100'}`}`}>
+      
+      {/* Image Header */}
+      <div className="h-64 relative overflow-hidden shrink-0">
+        {posting.imageUrl ? (
+            <img src={posting.imageUrl} className="w-full h-full object-cover transition-transform duration-700 group-hover:scale-110" />
+        ) : (
+            <div className={`w-full h-full flex flex-col items-center justify-center text-slate-300 ${isClothes ? 'bg-indigo-50' : 'bg-slate-50'}`}>
+                {isClothes ? (
+                    <span className="text-6xl opacity-50">👕</span>
+                ) : (
+                    <svg className="w-16 h-16 mb-2 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
+                )}
+            </div>
+        )}
+        
+        {/* Gradient Overlay */}
+        <div className={`absolute inset-0 bg-gradient-to-t via-slate-900/20 to-transparent ${isClothes ? 'from-indigo-950/90' : 'from-slate-900/90'}`}></div>
+        
+        {/* Top Badges */}
+        <div className="absolute top-5 right-5 flex flex-col gap-2 items-end z-20">
+             {renderStatusPill()}
+             {isClothes && (
+                 <span className="px-3 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest backdrop-blur-md shadow-sm bg-white/20 text-white border border-white/20">
+                     Clothes
+                 </span>
+             )}
+             {posting.etaMinutes && (
+                 <span className="px-3 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest backdrop-blur-md shadow-lg bg-blue-600 text-white flex items-center gap-1 border border-blue-400/30">
+                    <svg className="w-3 h-3 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                    ETA: {posting.etaMinutes}m
+                 </span>
+             )}
+        </div>
+
+        {/* Action Buttons (Report, Share & Chat) */}
+        <div className="absolute top-5 left-5 z-20 flex flex-col gap-3">
+             <button 
+                onClick={(e) => { e.stopPropagation(); handleShare(); }}
+                className="p-3 rounded-full bg-white/20 backdrop-blur-md text-white hover:bg-white hover:text-blue-600 border border-white/20 transition-all shadow-lg group/share"
+                title="Share details"
+            >
+                <svg className="w-5 h-5 group-hover/share:scale-110 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z" /></svg>
+            </button>
+
+            {isInvolved && onChatClick && (
+                <button 
+                    onClick={(e) => { e.stopPropagation(); onChatClick(posting.id); }}
+                    className="p-3 rounded-full bg-white/20 backdrop-blur-md text-white hover:bg-white hover:text-emerald-600 border border-white/20 transition-all shadow-lg group/chat"
+                    title="Chat with group"
+                >
+                    <svg className="w-5 h-5 group-hover/chat:scale-110 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" /></svg>
+                </button>
+            )}
+
+            <button 
+                onClick={(e) => { e.stopPropagation(); handleReport(); }}
+                className="p-3 rounded-full bg-white/20 backdrop-blur-md text-white hover:bg-white hover:text-rose-600 border border-white/20 transition-all shadow-lg group/report"
+                title="Report Posting"
+            >
+                <svg className="w-5 h-5 group-hover/report:scale-110 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                </svg>
+            </button>
+        </div>
+
+        {/* Bottom Content Info */}
+        <div className="absolute bottom-6 left-6 right-6 text-white z-20">
+            <div className="flex items-center gap-2 mb-2">
+                 <span className="bg-white/20 backdrop-blur-md px-3 py-1 rounded-lg text-[10px] font-bold uppercase border border-white/20 tracking-wider shadow-sm flex items-center gap-1">
+                    {isClothes ? (
+                        <span className="text-sm">👕</span>
+                    ) : (
+                        <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" /></svg>
+                    )}
+                    {posting.quantity}
+                 </span>
+                 {hoursLeft > 0 && (
+                    <span className={`px-3 py-1 rounded-lg text-[10px] font-bold uppercase backdrop-blur-md border border-white/10 shadow-sm flex items-center gap-1 ${hoursLeft < 12 ? 'bg-rose-500/80 text-white' : 'bg-black/30 text-slate-200'}`}>
+                        <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                        {hoursLeft < 24 ? `${Math.floor(hoursLeft)}h left` : `${Math.floor(hoursLeft / 24)}d left`}
+                    </span>
+                 )}
+            </div>
+            <h3 className="font-black text-2xl leading-tight text-white line-clamp-2 drop-shadow-md mb-2">{posting.foodName}</h3>
+            
+            <div className="flex items-center gap-2 text-xs font-medium text-slate-300">
+                <div className="w-5 h-5 rounded-full bg-white/20 flex items-center justify-center text-[10px] text-white font-bold uppercase">
+                    {posting.donorName.charAt(0)}
+                </div>
+                <span>{posting.donorOrg || posting.donorName}</span>
+            </div>
+        </div>
+
+        {/* Safety Warning Overlay */}
+        {isSafetyUnknownOrUnsafe && (
+             <div className="absolute inset-0 bg-rose-950/90 backdrop-blur-sm flex items-center justify-center p-8 text-center z-30">
+                 <div>
+                     <div className="w-16 h-16 bg-white rounded-full flex items-center justify-center mx-auto mb-4 text-rose-500 shadow-2xl animate-pulse">
+                        <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
+                     </div>
+                     <h4 className="text-white font-black text-xl mb-2">Quality Check Failed</h4>
+                     <p className="text-rose-200 text-sm mb-6 font-medium leading-relaxed">{posting.safetyVerdict?.reasoning}</p>
+                     
+                     {user?.role === UserRole.DONOR && posting.donorId === user?.id && (
+                        <button 
+                            onClick={(e) => { e.stopPropagation(); handleManualSafetyOverride(); }}
+                            className="bg-white text-rose-600 px-6 py-3 rounded-xl text-xs font-black hover:bg-rose-50 transition-colors shadow-lg uppercase tracking-wide"
+                        >
+                            Mark Verified Safe
+                        </button>
+                     )}
+                 </div>
+             </div>
+        )}
+      </div>
+
+      {/* Main Body */}
+      <div className={`p-6 flex-1 flex flex-col ${isSafetyUnknownOrUnsafe ? 'opacity-50 pointer-events-none' : ''}`}>
+          
+          <div className="flex items-start gap-2 mb-6">
+              {posting.description && (
+                <p className="text-sm text-slate-500 font-medium leading-relaxed line-clamp-2 flex-1">{posting.description}</p>
+              )}
+              <button 
+                onClick={handleTTS} 
+                disabled={isPlaying}
+                className={`p-2 rounded-full transition-colors ${isPlaying ? 'bg-emerald-100 text-emerald-600 animate-pulse' : 'bg-slate-100 text-slate-400 hover:text-slate-600'}`}
+                title="Read Aloud"
+              >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" /></svg>
+              </button>
+          </div>
+
+          {posting.foodTags && (
+                <div className="flex flex-wrap gap-2 mb-6">
+                    {posting.foodTags.slice(0, 3).map(tag => (
+                        <span key={tag} className="text-[10px] font-bold bg-slate-100 text-slate-500 px-2.5 py-1 rounded-md uppercase tracking-wide border border-slate-200">{tag}</span>
+                    ))}
+                </div>
+          )}
+          
+          <div className="mt-auto space-y-4">
+              
+              {/* Location Row with Maps Grounding Insight */}
+              <div>
+                  <div className="flex items-start gap-3 group/loc cursor-pointer" onClick={() => window.open(mapsUrl, '_blank')}>
+                     <div className={`w-10 h-10 rounded-2xl bg-slate-50 flex items-center justify-center shrink-0 text-slate-400 transition-colors border border-slate-100 ${isClothes ? 'group-hover/loc:bg-indigo-50 group-hover/loc:text-indigo-600' : 'group-hover/loc:bg-emerald-50 group-hover/loc:text-emerald-600'}`}>
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+                     </div>
+                     <div className="flex-1 min-w-0 py-0.5">
+                         <div className="flex justify-between items-center">
+                             <p className="text-[10px] font-black text-slate-400 uppercase tracking-wider mb-0.5">Pickup Location</p>
+                             <button onClick={(e) => { e.stopPropagation(); handleLocationInsight(); }} className={`text-[9px] font-bold uppercase tracking-wider px-2 py-0.5 rounded transition-colors ${isClothes ? 'text-indigo-600 hover:text-indigo-800 bg-indigo-50' : 'text-emerald-600 hover:text-emerald-800 bg-emerald-50'}`}>
+                                 {locationInsight ? 'Hide Info' : 'Analyze Location'}
+                             </button>
+                         </div>
+                         <p className={`text-sm font-bold text-slate-700 leading-snug line-clamp-1 transition-colors ${isClothes ? 'group-hover/loc:text-indigo-700' : 'group-hover/loc:text-emerald-700'}`}>
+                            {posting.location.line1}
+                         </p>
+                     </div>
+                  </div>
+                  
+                  {/* Maps Grounding Result Display */}
+                  {isLoadingInsight && (
+                      <div className="mt-2 ml-14 p-2">
+                          <p className="text-xs text-slate-400 font-bold animate-pulse flex items-center gap-2">
+                              <svg className="animate-spin h-3 w-3" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                              Asking Gemini Maps...
+                          </p>
+                      </div>
+                  )}
+                  {locationInsight && (
+                      <div className={`mt-3 ml-14 rounded-xl p-3 border animate-fade-in-up ${isClothes ? 'bg-indigo-50/50 border-indigo-100/50' : 'bg-emerald-50/50 border-emerald-100/50'}`}>
+                          <p className="text-xs text-slate-600 font-medium leading-relaxed">{locationInsight.text}</p>
+                          {locationInsight.sources && locationInsight.sources.length > 0 && (
+                              <div className="mt-2 flex flex-wrap gap-2">
+                                  {locationInsight.sources.map((s, i) => (
+                                      s.maps?.uri && (
+                                          <a key={i} href={s.maps.uri} target="_blank" rel="noreferrer" className={`text-[9px] font-bold bg-white px-2 py-1 rounded border hover:shadow-sm transition-all truncate max-w-full ${isClothes ? 'text-indigo-700 border-indigo-100' : 'text-emerald-700 border-emerald-100'}`}>
+                                              📍 {s.maps.title}
+                                          </a>
+                                      )
+                                  ))}
+                              </div>
+                          )}
+                      </div>
+                  )}
+              </div>
+
+              {/* Volunteer Row */}
+              {posting.volunteerName && (
+                  <div className="flex items-center gap-3 bg-blue-50/50 p-3 rounded-2xl border border-blue-100/50">
+                     {volunteerProfile?.profilePictureUrl ? (
+                       <img src={volunteerProfile.profilePictureUrl} className="w-10 h-10 rounded-full object-cover shadow-sm shrink-0 ring-2 ring-white" alt={posting.volunteerName} />
+                     ) : (
+                       <div className="w-10 h-10 rounded-full bg-blue-100 text-blue-600 flex items-center justify-center shrink-0 font-black text-xs ring-2 ring-white">
+                          {posting.volunteerName.charAt(0)}
+                       </div>
+                     )}
+                     <div className="flex-1">
+                         <p className="text-[9px] font-black text-blue-400 uppercase tracking-wider mb-0.5">Volunteer</p>
+                         <p className="text-sm font-bold text-slate-800 leading-snug">{posting.volunteerName}</p>
+                     </div>
+                  </div>
+              )}
+
+              {/* Status Specific UI - Waiting for Pickup Verification */}
+              {user?.role === UserRole.VOLUNTEER && posting.status === FoodStatus.PICKUP_VERIFICATION_PENDING && (
+                 <div className="bg-amber-50 p-4 rounded-2xl border border-amber-100">
+                     <div className="flex items-center gap-2 mb-2 text-amber-800 font-black text-[10px] uppercase tracking-widest">
+                         <div className="w-2 h-2 rounded-full bg-amber-500 animate-pulse"></div>
+                         Pending Pickup Approval
+                     </div>
+                     <p className="text-slate-600 text-xs font-medium leading-relaxed">
+                         Proof sent to <span className="font-bold text-slate-900">{posting.donorOrg || posting.donorName}</span>.
+                     </p>
+                     <div className="mt-3 flex gap-2">
+                        <button onClick={() => setShowPreview(true)} className="text-[10px] font-bold text-amber-700 underline decoration-amber-300/50">View Proof</button>
+                        <button onClick={handleRetractVerification} className="text-[10px] font-bold text-rose-600 ml-auto hover:underline">Retract</button>
+                     </div>
+                 </div>
+              )}
+
+              {/* Status Specific UI - Waiting for Delivery Verification */}
+              {user?.role === UserRole.REQUESTER && posting.status === FoodStatus.DELIVERY_VERIFICATION_PENDING && (
+                 <div className="bg-purple-50 p-4 rounded-2xl border border-purple-100">
+                     <div className="flex items-center gap-2 mb-2 text-purple-800 font-black text-[10px] uppercase tracking-widest">
+                         <div className="w-2 h-2 rounded-full bg-purple-500 animate-pulse"></div>
+                         Pending Delivery Approval
+                     </div>
+                     <p className="text-slate-600 text-xs font-medium leading-relaxed">
+                         Delivery proof sent by <span className="font-bold text-slate-900">{posting.volunteerName || 'Volunteer'}</span>. Please verify.
+                     </p>
+                     <div className="mt-3 flex gap-2">
+                         <button onClick={() => setShowPreview(true)} className="text-[10px] font-bold text-purple-700 underline decoration-purple-300/50">View Proof</button>
+                         <button onClick={() => setShowVerificationModal(true)} className="text-[10px] font-bold text-emerald-600 ml-auto bg-emerald-50 px-3 py-1.5 rounded-lg border border-emerald-100 hover:bg-emerald-100 transition-colors">Verify Now</button>
+                     </div>
+                 </div>
+              )}
+          </div>
+
+          {/* Action Buttons Area */}
+          <div className="pt-6 mt-6 border-t border-slate-100 grid gap-3">
+            {user?.role === UserRole.REQUESTER && posting.status === FoodStatus.AVAILABLE && (
+              <button onClick={handleRequest} className={`w-full text-white font-black py-4 rounded-2xl uppercase text-xs tracking-widest transition-all shadow-lg hover:-translate-y-0.5 flex items-center justify-center gap-2 ${isClothes ? 'bg-indigo-600 hover:bg-indigo-700 shadow-indigo-200 hover:shadow-indigo-300' : 'bg-emerald-600 hover:bg-emerald-700 shadow-emerald-200 hover:shadow-emerald-300'}`}>
+                Request Pickup
+              </button>
+            )}
+            
+            {user?.role === UserRole.REQUESTER && posting.status === FoodStatus.IN_TRANSIT && (
+              <button onClick={() => setShowTracking(true)} className="w-full bg-orange-500 hover:bg-orange-600 text-white font-black py-4 rounded-2xl uppercase text-xs tracking-widest flex items-center justify-center gap-2 shadow-lg shadow-orange-200 animate-pulse hover:animate-none transition-all">
+                Track Live Delivery
+              </button>
+            )}
+
+            {user?.role === UserRole.VOLUNTEER && posting.status === FoodStatus.AVAILABLE && (
+              <button onClick={handleExpressInterest} className="w-full bg-purple-600 hover:bg-purple-700 text-white font-black py-4 rounded-2xl uppercase text-xs tracking-widest transition-all shadow-lg shadow-purple-200 hover:shadow-purple-300 hover:-translate-y-0.5">
+                Volunteer Interest
+              </button>
+            )}
+
+            {user?.role === UserRole.VOLUNTEER && posting.status === FoodStatus.REQUESTED && !posting.volunteerId && (
+               !isConfirmingStart ? (
+                  <button onClick={() => setIsConfirmingStart(true)} className={`w-full text-white font-black py-4 rounded-2xl uppercase text-xs tracking-widest flex items-center justify-center gap-2 shadow-lg transition-all hover:-translate-y-0.5 ${isClothes ? 'bg-indigo-600 hover:bg-indigo-700 shadow-indigo-200' : 'bg-emerald-600 hover:bg-emerald-700 shadow-emerald-200'}`}>
+                    Start Delivery Mission
+                  </button>
+               ) : (
+                  <div className="flex gap-2 animate-fade-in-up">
+                      <button onClick={() => setIsConfirmingStart(false)} className="flex-1 py-3 bg-slate-100 text-slate-500 font-bold rounded-xl text-xs uppercase tracking-wider hover:bg-slate-200 transition-colors">Cancel</button>
+                      <button onClick={confirmStartVolunteering} className={`flex-1 py-3 text-white font-bold rounded-xl text-xs uppercase tracking-wider transition-colors shadow-lg ${isClothes ? 'bg-indigo-600 hover:bg-indigo-700 shadow-indigo-200' : 'bg-emerald-600 hover:bg-emerald-700 shadow-emerald-200'}`}>Confirm</button>
+                  </div>
+               )
+            )}
+
+            {user?.role === UserRole.VOLUNTEER && posting.status === FoodStatus.REQUESTED && posting.volunteerId === user?.id && (
+                <div className="flex flex-col gap-2">
+                    <button onClick={() => pickupInputRef.current?.click()} disabled={isPickingUp} className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-black py-4 rounded-2xl uppercase text-xs tracking-widest flex items-center justify-center gap-2 shadow-lg shadow-indigo-200 transition-all hover:-translate-y-0.5 disabled:opacity-50">
+                        {isPickingUp ? 'Uploading...' : 'Upload Pickup Proof'}
+                    </button>
+                    {requesterProfile?.contactNo && (
+                        <a href={`tel:${requesterProfile.contactNo}`} className="w-full bg-white border-2 border-slate-100 hover:border-blue-200 text-slate-600 hover:text-blue-600 font-bold py-3 rounded-2xl uppercase text-xs tracking-widest flex items-center justify-center gap-2 transition-all">
+                            Call Requester
+                        </a>
+                    )}
+                </div>
+            )}
+
+            {user?.role === UserRole.VOLUNTEER && posting.volunteerId === user?.id && posting.status === FoodStatus.IN_TRANSIT && (
+                <div className="flex gap-2">
+                    {posting.requesterAddress && (
+                        <button onClick={() => setShowDirections(true)} className="flex-1 bg-blue-500 hover:bg-blue-600 text-white font-bold py-3 rounded-xl uppercase text-[10px] tracking-widest shadow-md hover:-translate-y-0.5 transition-all">
+                            Directions
+                        </button>
+                    )}
+                    {/* Volunteer can also initiate verification if Requester is unable */}
+                    <button onClick={() => !posting.verificationImageUrl && fileInputRef.current?.click()} className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-3 rounded-xl uppercase text-[10px] tracking-widest shadow-md hover:-translate-y-0.5 transition-all">
+                        Verify Delivery
+                    </button>
+                </div>
+            )}
+
+            {/* Donor Actions */}
+            {user?.role === UserRole.DONOR && (
+                <>
+                    {posting.status === FoodStatus.PICKUP_VERIFICATION_PENDING && (
+                        <button onClick={() => setShowVerificationModal(true)} className="w-full bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 text-white font-black py-4 rounded-2xl uppercase text-xs tracking-widest flex items-center justify-center gap-2 shadow-lg shadow-amber-200 animate-pulse transition-all">
+                            Review Pickup Proof
+                        </button>
+                    )}
+                    
+                    {/* Cancel Donation Button (For Donors when Available or Requested) */}
+                    {(posting.status === FoodStatus.AVAILABLE || posting.status === FoodStatus.REQUESTED) && (
+                         <button onClick={() => setShowCancelConfirmation(true)} className="w-full bg-rose-50 hover:bg-rose-100 border-2 border-rose-100 text-rose-500 hover:text-rose-600 font-black py-4 rounded-2xl uppercase text-xs tracking-widest flex items-center justify-center gap-2 transition-all shadow-sm">
+                             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                             Cancel Donation
+                         </button>
+                    )}
+                </>
+            )}
+
+            {/* Requester Actions: Upload Verification */}
+            {user?.role === UserRole.REQUESTER && posting.status === FoodStatus.IN_TRANSIT && (
+                <button 
+                  onClick={() => !posting.verificationImageUrl && fileInputRef.current?.click()} 
+                  disabled={isVerifying}
+                  className={`w-full font-black py-4 rounded-2xl uppercase text-xs tracking-widest flex items-center justify-center gap-2 shadow-lg transition-all bg-teal-600 hover:bg-teal-700 text-white shadow-teal-200 hover:-translate-y-0.5`}
+                >
+                  {isVerifying ? 'Uploading...' : 'Confirm Receipt & Upload Proof'}
+                </button>
+            )}
+            
+            {/* Requester Verification of Volunteer Upload */}
+            {user?.role === UserRole.REQUESTER && posting.status === FoodStatus.DELIVERY_VERIFICATION_PENDING && (
+                <button onClick={() => setShowVerificationModal(true)} className="w-full bg-gradient-to-r from-purple-500 to-indigo-500 hover:from-purple-600 hover:to-indigo-600 text-white font-black py-4 rounded-2xl uppercase text-xs tracking-widest flex items-center justify-center gap-2 shadow-lg shadow-purple-200 animate-pulse transition-all">
+                    Review Delivery Proof
+                </button>
+            )}
+            
+            {user?.role === UserRole.REQUESTER && posting.status === FoodStatus.DELIVERED && !hasRated && onRateVolunteer && posting.volunteerId && (
+                <button onClick={() => setShowRating(true)} className="w-full bg-yellow-400 hover:bg-yellow-500 text-slate-900 font-black py-4 rounded-2xl uppercase text-xs tracking-widest flex items-center justify-center gap-2 shadow-lg shadow-yellow-200 hover:-translate-y-0.5 transition-all">
+                    Rate Volunteer
+                </button>
+            )}
+
+            {/* Inputs */}
+            <input type="file" ref={fileInputRef} className="hidden" accept="image/*" onChange={handleVerificationUpload} />
+            <input type="file" ref={pickupInputRef} className="hidden" accept="image/*" onChange={handlePickupUpload} />
+          </div>
+      </div>
+
+      {/* Modals */}
+      {showDirections && (
+          <DirectionsModal 
+            origin={getOriginString()} 
+            destination={getDestinationString()} 
+            waypoint={getPickupString()}
+            onClose={() => setShowDirections(false)} 
+          />
+      )}
+      {showTracking && (
+          <LiveTrackingModal
+            posting={posting}
+            onClose={() => setShowTracking(false)}
+          />
+      )}
+      {showRating && posting.volunteerName && onRateVolunteer && (
+          <RatingModal
+             volunteerName={posting.volunteerName}
+             onClose={() => setShowRating(false)}
+             onSubmit={(rating, feedback) => {
+                 onRateVolunteer(posting.id, rating, feedback);
+                 setShowRating(false);
+             }}
+          />
+      )}
+      {showPreview && (posting.pickupVerificationImageUrl || posting.verificationImageUrl) && (
+          <div className="fixed inset-0 z-[300] bg-black/95 backdrop-blur-md flex items-center justify-center p-4 animate-fade-in-up" onClick={() => setShowPreview(false)}>
+              <div className="relative max-w-5xl max-h-[90vh] w-full flex items-center justify-center">
+                  <img src={posting.status === FoodStatus.DELIVERY_VERIFICATION_PENDING ? posting.verificationImageUrl : posting.pickupVerificationImageUrl} className="max-w-full max-h-[85vh] object-contain rounded-2xl shadow-2xl ring-1 ring-white/10" onClick={(e) => e.stopPropagation()} />
+                  <button onClick={() => setShowPreview(false)} className="absolute top-4 right-4 text-white/50 hover:text-white transition-colors bg-white/10 hover:bg-white/20 p-3 rounded-full backdrop-blur-md">
+                      <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" /></svg>
+                  </button>
+              </div>
+          </div>
+      )}
+      {showVerificationModal && (
+          <VerificationRequestModal 
+             posting={posting}
+             onApprove={handleApprove}
+             onReject={handleReject}
+          />
+      )}
+      {showCancelConfirmation && (
+        <div className="fixed inset-0 z-[300] bg-slate-900/60 backdrop-blur-md flex items-center justify-center p-4 animate-fade-in-up">
+            <div className="bg-white rounded-3xl w-full max-w-sm p-8 shadow-2xl text-center">
+                <div className="w-16 h-16 bg-rose-50 text-rose-500 rounded-full flex items-center justify-center mx-auto mb-6 shadow-inner">
+                    <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                </div>
+                <h3 className="text-xl font-black text-slate-800 mb-2">Cancel Donation?</h3>
+                <p className="text-slate-500 text-sm font-medium mb-8 leading-relaxed">
+                    Are you sure? This will remove the posting and notify any assigned volunteers or requesters.
+                </p>
+                <div className="flex gap-3">
+                    <button onClick={() => setShowCancelConfirmation(false)} className="flex-1 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded-2xl transition-colors uppercase text-xs tracking-wider">Keep It</button>
+                    <button onClick={handleConfirmDelete} className="flex-1 py-3 bg-rose-500 hover:bg-rose-600 text-white font-bold rounded-2xl transition-colors shadow-lg shadow-rose-200 uppercase text-xs tracking-wider">Yes, Cancel</button>
+                </div>
+            </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default FoodCard;
