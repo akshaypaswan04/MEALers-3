@@ -1,6 +1,6 @@
 
 import React, { useEffect, useRef, useState } from 'react';
-import { FoodPosting, FoodStatus } from '../types';
+import { FoodPosting } from '../types';
 import { storage } from '../services/storageService';
 import * as L from 'leaflet';
 
@@ -80,25 +80,6 @@ const LiveTrackingModal: React.FC<LiveTrackingModalProps> = ({ posting, onClose 
 
       const { location: pickup, requesterAddress: dropoff, volunteerLocation } = livePosting;
       const bounds = L.latLngBounds([]);
-
-      // --- Helper to create HTML Icons ---
-      const createIcon = (emoji: string, bgColor: string, ringColor: string, pulse: boolean = false) => {
-          return L.divIcon({
-              className: 'custom-map-icon',
-              html: `
-                <div class="relative w-10 h-10 flex items-center justify-center">
-                    ${pulse ? `<div class="absolute inset-0 bg-${ringColor} rounded-full animate-ping opacity-75"></div>` : ''}
-                    <div class="relative w-10 h-10 bg-${bgColor} rounded-full border-4 border-white shadow-lg flex items-center justify-center text-xl z-10">
-                        ${emoji}
-                    </div>
-                    <div class="absolute -bottom-1 w-2 h-2 bg-slate-400 rotate-45"></div>
-                </div>
-              `,
-              iconSize: [40, 40],
-              iconAnchor: [20, 42], // Tip of the "pin"
-              popupAnchor: [0, -45]
-          });
-      };
 
       // 1. Pickup Marker
       if (pickup?.lat && pickup?.lng) {

@@ -28,11 +28,6 @@ const getBase64 = (dataUrl: string) => {
     return dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
 };
 
-// Helper to clean JSON string from Markdown
-const cleanJson = (text: string) => {
-    return text.replace(/```json\n?|```/g, '').trim();
-};
-
 const apiKey = process.env.API_KEY || '';
 const ai = new GoogleGenAI({ apiKey });
 
@@ -372,7 +367,7 @@ export const getAddressFromPincode = async (pincode: string): Promise<ReverseGeo
 };
 
 // --- 6. Route Insights ---
-export const getRouteInsights = async (location: string, userLat?: number, userLng?: number) => {
+export const getRouteInsights = async (location: string, _userLat?: number, _userLng?: number) => {
   try {
       const response = await ai.models.generateContent({
           model: 'gemini-3-flash-preview',
@@ -436,7 +431,7 @@ export const calculateLiveEta = async (
 };
 
 // --- 9. Geocoding Fallback ---
-export const reverseGeocode = async (lat: number, lng: number): Promise<ReverseGeocodeResult | null> => {
+export const reverseGeocode = async (_lat: number, _lng: number): Promise<ReverseGeocodeResult | null> => {
     return null; 
 };
 

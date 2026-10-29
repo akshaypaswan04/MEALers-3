@@ -1,6 +1,6 @@
 
 import React, { useEffect, useRef, useState } from 'react';
-import { FoodPosting, FoodStatus } from '../types';
+import { FoodPosting } from '../types';
 import * as L from 'leaflet';
 
 interface PostingsMapProps {

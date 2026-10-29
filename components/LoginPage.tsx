@@ -124,7 +124,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
       } finally {
         setDetectingLoc(false);
       }
-    }, (err) => {
+    }, () => {
       setError("Location access denied. Please use the map.");
       setDetectingLoc(false);
     });
@@ -306,8 +306,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLogin }) => {
           const credential = PhoneAuthProvider.credential(confirmationResult.verificationId, otp);
 
           // Sign in with the credential
-          const result = await signInWithCredential(auth, credential);
-          const user = result.user;
+          await signInWithCredential(auth, credential);
 
           // 2. Now user is auth.currentUser. We can proceed to set password.
           setLoading(false);
